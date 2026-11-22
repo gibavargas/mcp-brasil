@@ -81,6 +81,8 @@ func main() {
 		cmdProbe(engine, os.Args[2:])
 	case "serve":
 		cmdServe(engine, os.Args[2:])
+	case "harvest":
+		cmdHarvest(engine, os.Args[2:])
 	case "help", "-h", "--help":
 		printUsage()
 	default:
@@ -147,6 +149,8 @@ Comandos disponíveis:
       Compara a estrutura de transparência entre múltiplos municípios ou estados.
   probe <nome_ou_ibge> [--uf <UF>] [--json]
       Testa conectividade e latência dos portais de transparência do alvo.
+  harvest [--uf <UF>] [--ibges <lista>] [--modules servidores,contratos,despesas] [--ano YYYY] [--mes M] [--limit 100] [--workers 8] [--rate-limit-ms 250] [--timeout-sec 15] [--out arquivo.ndjson] [--resume] [--api-only] [--max-cities 0] [--json]
+      Coleta concorrente em lote de dados municipais em formato NDJSON com rate-limit por host e suporte a retomada (--resume).
   serve [--port 8081]
       Inicia um microserviço HTTP nativo de alta performance com endpoints REST.`)
 }
@@ -1507,3 +1511,69 @@ func truncateStr(s string, max int) string {
 	}
 	return string(runes[:max-3]) + "..."
 }
+
+func cmdHarvest(engine *transparencia.Engine, args []string) {
+	fs := flag.NewFlagSet("harvest", flag.ExitOnError)
+	ufFlag := fs.String("uf", "", "Filtrar por UF (ex: MG, SP; vazio = Brasil inteiro)")
+	ibgesFlag := fs.String("ibges", "", "Lista de códigos IBGE separados por vírgula")
+	modulesFlag := fs.String("modules", "servidores,contratos,despesas", "Módulos a coletar separados por vírgula")
+	anoFlag := fs.Int("ano", 0, "Ano de referência (padrão: atual)")
+	mesFlag := fs.Int("mes", 0, "Mês de referência (1-12)")
+	limitFlag := fs.Int("limit", 100, "Limite de registros por módulo/município")
+	workersFlag := fs.Int("workers", 8, "Número de workers concorrentes (1-32)")
+	rateMsFlag := fs.Int("rate-limit-ms", 250, "Espaçamento mínimo por host em milissegundos")
+	timeoutSecFlag := fs.Int("timeout-sec", 15, "Timeout por município em segundos")
+	outFlag := fs.String("out", "", "Caminho do arquivo NDJSON de saída (vazio = stdout)")
+	resumeFlag := fs.Bool("resume", false, "Retoma coleta pulando códigos IBGE já presentes em --out")
+	apiOnlyFlag := fs.Bool("api-only", false, "Coleta apenas municípios do catálogo de APIs estruturadas")
+	maxCitiesFlag := fs.Int("max-cities", 0, "Limite máximo de municípios (0 = sem limite)")
+	jsonOut := fs.Bool("json", false, "Imprime resumo final em JSON (quando --out está definido)")
+
+	if _, err := parseFlexibleArgs(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "Erro nos parâmetros do harvest: %v\n", err)
+		os.Exit(1)
+	}
+
+	var ibges []string
+	if strings.TrimSpace(*ibgesFlag) != "" {
+		ibges = strings.Split(*ibgesFlag, ",")
+	}
+	cfg := transparencia.HarvestConfig{
+		UF:        *ufFlag,
+		IBGEs:     ibges,
+		Modules:   strings.Split(*modulesFlag, ","),
+		Ano:       *anoFlag,
+		Mes:       *mesFlag,
+		Limit:     *limitFlag,
+		Workers:   *workersFlag,
+		RateLimit: time.Duration(*rateMsFlag) * time.Millisecond,
+		Timeout:   time.Duration(*timeoutSecFlag) * time.Second,
+		OutPath:   *outFlag,
+		Resume:    *resumeFlag,
+		APIOnly:   *apiOnlyFlag,
+		MaxCities: *maxCitiesFlag,
+	}
+
+	hub := transparencia.NewHub(engine)
+	summary, err := transparencia.RunHarvest(context.Background(), hub, cfg, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Erro durante harvest: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Quando --out está vazio, os registros NDJSON foram enviados para stdout; envia resumo para stderr.
+	if strings.TrimSpace(*outFlag) == "" {
+		b, _ := json.Marshal(summary)
+		fmt.Fprintln(os.Stderr, string(b))
+		return
+	}
+	if *jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(summary)
+		return
+	}
+	fmt.Printf("Harvest concluído: %d/%d municípios processados (%d pulados por resume, %d com dados, %d com erros) em %dms -> %s\n",
+		summary.Processed, summary.TotalTargets, summary.SkippedResume, summary.WithData, summary.WithErrors, summary.DurationMs, summary.OutPath)
+}
+
