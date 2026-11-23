@@ -90,6 +90,274 @@ def _in_scope(scope: set[str] | None, *node_ids: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Classificador de pagamentos PF <-> Servidor (filtro de falsos positivos MCASP)
+# ---------------------------------------------------------------------------
+
+PF_SERVIDOR_FALSE_POSITIVE_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "ESTORNO_OU_SEM_VALOR",
+        "DIARIA_PASSAGEM",
+        "FOLHA_VENCIMENTO_BENEFICIO",
+        "REEMBOLSO_INDENIZACAO_ADIANTAMENTO",
+        "TABELA_HTML_ESPELHADA",
+    }
+)
+
+# Prefixos MCASP (6 dígitos) correspondentes a diárias/passagens regulares de servidor
+_MCASP_DIARIA_PASSAGEM = ("339014", "339015", "339033")
+
+# Prefixos MCASP de pessoal, folha, benefícios e auxílios regulares
+_MCASP_FOLHA_BENEFICIO_PREFIXES = (
+    "3190",
+    "3191",
+    "339008",
+    "339018",
+    "339020",
+    "339034",
+    "339046",
+    "339048",
+    "339049",
+)
+
+# Prefixos MCASP de indenizações, restituições e sentenças judiciais
+_MCASP_REEMBOLSO_INDENIZACAO = ("339093", "339091", "319094")
+
+# Prefixos MCASP de contratação comercial / fornecimento / serviços / obras
+_MCASP_COMERCIAL = (
+    "339030",  # Material de Consumo
+    "339035",  # Serviços de Consultoria
+    "339036",  # Outros Serviços de Terceiros - Pessoa Física
+    "339039",  # Outros Serviços de Terceiros - Pessoa Jurídica
+    "449051",  # Obras e Instalações
+    "449052",  # Equipamentos e Material Permanente
+    "449061",  # Aquisição de Imóveis
+)
+
+_KW_DIARIA_PASSAGEM = (
+    "DIARIA",
+    "DIARIAS",
+    "PASSAGEM AEREA",
+    "PASSAGENS AEREAS",
+    "PASSAGEM TERRESTRE",
+    "PASSAGENS E DESPESAS COM LOCOMOCAO",
+    "AJUDA DE CUSTO",
+    "PERNOITE",
+    "CONCESSAO DE PORTARIA",
+)
+
+_KW_REEMBOLSO_ADIANTAMENTO = (
+    "RESSARCIMENTO",
+    "REEMBOLSO",
+    "RESTITUICAO",
+    "RESTITUICOES",
+    "INDENIZACAO",
+    "INDENIZACOES",
+    "SUPRIMENTO DE FUNDO",
+    "SUPRIMENTO DE FUNDOS",
+    "REGIME DE ADIANTAMENTO",
+    "ADIANTAMENTO DE",
+    "PRONTO PAGAMENTO",
+    "SENTENCA JUDICIAL",
+    "PRECATORIO",
+    "ALVARA JUDICIAL",
+    "PENSAO ALIMENTICIA",
+)
+
+_KW_FOLHA_BENEFICIO = (
+    "FOLHA DE PAGAMENTO",
+    "VENCIMENTO SALARIAL",
+    "VENCIMENTOS SALARIAIS",
+    "VENCIMENTOS E VANTAGENS",
+    "SUBSIDIO SALARIAL",
+    "SUBSIDIO DO ",
+    "SUBSIDIO DE ",
+    "SUBSIDIOS DEVIDOS",
+    "REVISAO GERAL DE SUBSIDIO",
+    "DECIMO TERCEIRO",
+    "13 SALARIO",
+    "13O SALARIO",
+    "ADICIONAL DE 1 3 DE FERIAS",
+    "1 3 DE FERIAS",
+    "ACERTO DE VERBAS SALARIAIS",
+    "VERBAS RESCISORIAS",
+    "LICENCA PREMIO",
+    "HORA EXTRA",
+    "HORAS EXTRAS",
+    "AUXILIO ALIMENTACAO",
+    "AUXILIO TRANSPORTE",
+    "AUXILIO MORADIA",
+    "AUXILIO FUNERAL",
+    "AUXILIO NATALIDADE",
+    "VALE ALIMENTACAO",
+    "VALE TRANSPORTE",
+    "BOLSA ESTAGIO",
+    "ESTAGIARIO",
+    "ABONO SALARIAL",
+    "PROVENTOS",
+    "CONVENIO IPASGO",
+    "PLANO DE SAUDE",
+    "CONTRATACAO POR TEMPO DETERMINADO",
+    "CONTRATACAO TEMPORARIA",
+    "PROCESSO SELETIVO SIMPLIFICADO",
+    "CONTRATACAO DE AGENTE COMUNITARIO",
+    "CONTRATACAO DE AGENTE DE COMBATE",
+    "PAGAMENTO DO SALARIO",
+    "PAGAMENTO DE SALARIO",
+)
+
+_KW_COMERCIAL = (
+    "LOCACAO",
+    "ALUGUEL",
+    "AQUISICAO",
+    "FORNECIMENTO DE ",
+    "PRESTACAO DE SERVICO",
+    "PRESTACAO DE SERVICOS",
+    "CONSULTORIA",
+    "ASSESSORIA JURIDICA",
+    "ASSESSORIA CONTABIL",
+    "OBRA ",
+    "OBRAS ",
+    "REFORMA",
+    "CONSTRUCAO",
+    "MANUTENCAO",
+    "TRANSPORTE ESCOLAR",
+    "FRETE",
+    "LICITACAO",
+    "PREGAO",
+    "INEXIGIBILIDADE",
+    "DISPENSA DE LICITACAO",
+    "CREDENCIAMENTO",
+)
+
+
+def _extract_mcasp_code(elemento: str) -> str:
+    """Extrai os 6 dígitos iniciais da natureza de despesa MCASP (ex: 3.3.90.14 -> 339014)."""
+    digits = "".join(ch for ch in (elemento or "") if ch.isdigit())
+    return digits[:6] if len(digits) >= 6 else digits
+
+
+def classify_pf_servidor_payment(
+    edge: GraphEdge,
+    *,
+    serv_cargos: set[str] | None = None,
+    has_diaria_record: bool = False,
+) -> tuple[str, str]:
+    """Classifica pagamento/contrato (município -> PF) feito a quem consta na folha municipal.
+
+    Separa pagamentos regulares inerentes ao vínculo funcional (diárias, passagens, folha,
+    auxílios, indenizações, contratações temporárias de pessoal, estornos e tabelas HTML
+    espelhadas) de contratos comerciais, locações ou fornecimentos diretos potencialmente
+    conflitantes (art. 9º/14 da Lei nº 14.133/2021).
+    """
+    meta = edge.metadata or {}
+    elemento_raw = str(meta.get("elemento") or "").strip()
+    historico_raw = str(meta.get("historico") or "").strip()
+    objeto_raw = str(meta.get("objeto") or "").strip()
+    funcao_raw = str(meta.get("funcao") or "").strip()
+
+    mcasp = _extract_mcasp_code(elemento_raw)
+    el_norm = normalize_name(elemento_raw)
+    text_norm = normalize_name(f"{elemento_raw} {objeto_raw} {historico_raw}")
+    obj_hist_norm = normalize_name(f"{objeto_raw} {historico_raw}")
+
+    # 1) Estornos (valor negativo) ou linhas sem valor sem objeto comercial explícito
+    if edge.valor < 0:
+        return ("ESTORNO_OU_SEM_VALOR", "Valor negativo (anulação/estorno contábil)")
+    if edge.valor == 0 and (
+        edge.tipo_relacao != "CONTRATOU" or not any(k in obj_hist_norm for k in _KW_COMERCIAL)
+    ):
+        return (
+            "ESTORNO_OU_SEM_VALOR",
+            "Registro sem valor pago/contratado (tabela espelhada)",
+        )
+
+    # 2) Tabela HTML espelhada (sem elemento/histórico e função igual ao cargo do servidor)
+    if (
+        edge.tipo_relacao == "PAGOU_DESPESA"
+        and not elemento_raw
+        and not historico_raw
+        and not objeto_raw
+    ):
+        fn_norm = normalize_name(funcao_raw)
+        if fn_norm and serv_cargos and fn_norm in serv_cargos:
+            return ("TABELA_HTML_ESPELHADA", "Campo função coincide com cargo do servidor (HTML)")
+        if has_diaria_record:
+            return ("DIARIA_PASSAGEM", "Despesa sem descrição associada a registro em diárias")
+
+    # 3) Natureza MCASP de diárias/passagens
+    if any(mcasp.startswith(p) for p in _MCASP_DIARIA_PASSAGEM):
+        return ("DIARIA_PASSAGEM", f"Elemento MCASP de diárias/passagens ({elemento_raw})")
+
+    # 4) Natureza MCASP de indenizações/restituições/sentenças
+    if any(mcasp.startswith(p) for p in _MCASP_REEMBOLSO_INDENIZACAO):
+        return (
+            "REEMBOLSO_INDENIZACAO_ADIANTAMENTO",
+            f"Elemento MCASP de indenização/restituição ({elemento_raw})",
+        )
+
+    # 5) Natureza MCASP de pessoal, folha, benefícios, auxílios e terceirização de pessoal
+    if any(mcasp.startswith(p) for p in _MCASP_FOLHA_BENEFICIO_PREFIXES):
+        return (
+            "FOLHA_VENCIMENTO_BENEFICIO",
+            f"Elemento MCASP de pessoal/benefício ({elemento_raw})",
+        )
+
+    # 5B) Contribuições de plano de saúde/previdência de servidor (339041)
+    if mcasp.startswith("339041") and any(
+        tok in text_norm
+        for tok in ("CONVENIO", "IPASGO", "PLANO DE SAUDE", "CONTRIBUICAO", "PREVIDENCIA", "RPPS")
+    ):
+        return (
+            "FOLHA_VENCIMENTO_BENEFICIO",
+            f"Contribuição/convênio funcional de servidor ({elemento_raw})",
+        )
+
+    # 6) Heurística textual explícita para diárias/viagens (mesmo quando elemento está vazio)
+    has_commercial_kw = any(k in obj_hist_norm for k in _KW_COMERCIAL)
+    if any(k in text_norm for k in _KW_DIARIA_PASSAGEM) and not (
+        "LOCACAO" in obj_hist_norm or "ALUGUEL" in obj_hist_norm
+    ):
+        return ("DIARIA_PASSAGEM", "Histórico indica diária/passagem/ajuda de custo de viagem")
+
+    # 7) Heurística textual explícita para reembolso / ressarcimento / suprimento de fundos
+    if any(k in text_norm for k in _KW_REEMBOLSO_ADIANTAMENTO):
+        return (
+            "REEMBOLSO_INDENIZACAO_ADIANTAMENTO",
+            "Histórico indica reembolso, indenização, adiantamento ou decisão judicial",
+        )
+
+    # 8) Heurística textual explícita para folha / salário / auxílio / contratação temporária
+    if any(k in text_norm for k in _KW_FOLHA_BENEFICIO) and not (
+        "LOCACAO" in obj_hist_norm or "ALUGUEL" in obj_hist_norm
+    ):
+        return (
+            "FOLHA_VENCIMENTO_BENEFICIO",
+            "Histórico/objeto indica remuneração, benefício ou contratação temporária de pessoal",
+        )
+
+    # 9) Contrato administrativo explícito (CONTRATOU) não enquadrado como pessoal/benefício
+    if edge.tipo_relacao == "CONTRATOU":
+        return (
+            "CONTRATO_COMERCIAL",
+            f"Contrato administrativo direto ({objeto_raw[:120] or 'objeto não detalhado'})",
+        )
+
+    # 10) Despesa com elemento MCASP comercial ou objeto comercial explícito
+    if any(mcasp.startswith(p) for p in _MCASP_COMERCIAL) or has_commercial_kw:
+        detalhe = elemento_raw or objeto_raw[:80] or historico_raw[:80] or el_norm
+        return (
+            "FORNECIMENTO_OU_SERVICO_COMERCIAL",
+            f"Despesa comercial/serviço ({detalhe})",
+        )
+
+    # 11) Fallback: pagamento positivo sem classificação detalhada no portal
+    return (
+        "NAO_CLASSIFICADO_SEM_DESCRICAO",
+        "Portal não informou elemento/histórico da despesa (requer conferência documental)",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Detector 1 — Conflito de Interesses (Fornecedor <-> QSA <-> Servidor / TSE)
 # ---------------------------------------------------------------------------
 
@@ -103,14 +371,16 @@ def detect_conflito_interesses(
     alerts: list[RiskAlert] = []
 
     # Mapas auxiliares
-    # empresa -> set[(municipio_id, total_valor, sample_edge)]
+    # empresa/pessoa -> dict[municipio_id, list[GraphEdge]]
     emp_mun_contracts: dict[str, dict[str, list[GraphEdge]]] = defaultdict(
         lambda: defaultdict(list)
     )
-    # pessoa -> set[empresa_id]
+    # pessoa -> list[GraphEdge]
     pessoa_empresas: dict[str, list[GraphEdge]] = defaultdict(list)
     # pessoa -> dict[municipio_id, list[GraphEdge]]
     pessoa_empregos: dict[str, dict[str, list[GraphEdge]]] = defaultdict(lambda: defaultdict(list))
+    # (pessoa_id, municipio_id) -> quantidade de registros explícitos em diárias
+    pessoa_mun_diarias: dict[tuple[str, str], int] = defaultdict(int)
     # pessoa -> list[GraphEdge] (vínculos TSE: CANDIDATOU_EM, DOOU_PARA, FORNECEU_CAMPANHA)
     pessoa_tse: dict[str, list[GraphEdge]] = defaultdict(list)
     # empresa -> list[GraphEdge] (vínculos TSE)
@@ -124,6 +394,8 @@ def detect_conflito_interesses(
             pessoa_empresas[e.src_id].append(e)
         elif e.tipo_relacao == "TRABALHA_EM":
             pessoa_empregos[e.src_id][e.dst_id].append(e)
+        elif e.tipo_relacao == "RECEBEU_DIARIA":
+            pessoa_mun_diarias[(e.src_id, e.dst_id)] += 1
         elif e.tipo_relacao in ("CANDIDATOU_EM", "DOOU_PARA", "FORNECEU_CAMPANHA"):
             if e.src_id.startswith("pessoa:"):
                 pessoa_tse[e.src_id].append(e)
@@ -211,6 +483,7 @@ def detect_conflito_interesses(
                 )
 
     # 1B) Pessoa física contratada/paga que também aparece na folha do mesmo município
+    #     (com filtro automático de diárias, folha/subsídios, auxílios, reembolsos e estornos)
     for pid, mun_map in emp_mun_contracts.items():
         if not pid.startswith("pessoa:"):
             continue
@@ -223,27 +496,115 @@ def detect_conflito_interesses(
                 continue
             m_node = nodes.get(mun_id)
             m_nome = m_node.nome if m_node else mun_id
-            total_val = sum(c.valor for c in c_edges)
+            emp_edges = pessoa_empregos[pid][mun_id]
+            cargos_raw = sorted(
+                {
+                    str(x.metadata.get("cargo", "")).strip()
+                    for x in emp_edges
+                    if x.metadata.get("cargo")
+                }
+            )
+            cargos_norm = {normalize_name(c) for c in cargos_raw if c}
+            has_diaria = pessoa_mun_diarias.get((pid, mun_id), 0) > 0
+
+            suspicious: list[tuple[GraphEdge, str, str]] = []
+            filtered_counts: dict[str, int] = defaultdict(int)
+            for ce in c_edges:
+                cat, motivo = classify_pf_servidor_payment(
+                    ce,
+                    serv_cargos=cargos_norm,
+                    has_diaria_record=has_diaria,
+                )
+                if cat in PF_SERVIDOR_FALSE_POSITIVE_CATEGORIES:
+                    filtered_counts[cat] += 1
+                else:
+                    suspicious.append((ce, cat, motivo))
+
+            if not suspicious:
+                continue
+
+            total_val = sum(ce.valor for ce, _, _ in suspicious)
+            cats = {cat for _, cat, _ in suspicious}
+            has_explicit_obj = any(
+                bool(str(ce.metadata.get("objeto") or ce.metadata.get("historico") or "").strip())
+                for ce, _, _ in suspicious
+            )
+
+            if "CONTRATO_COMERCIAL" in cats:
+                sev: SeverityLevel = "ALTA"
+                score = 88.0
+                natureza_lbl = "contrato administrativo direto"
+            elif "FORNECIMENTO_OU_SERVICO_COMERCIAL" in cats:
+                if has_explicit_obj or total_val >= 10_000.0:
+                    sev = "ALTA" if total_val >= 5_000.0 else "MEDIA"
+                    score = 84.0 if sev == "ALTA" else 76.0
+                else:
+                    sev = "MEDIA"
+                    score = 72.0
+                natureza_lbl = "despesa comercial/prestação de serviço (PF)"
+            else:
+                sev = "MEDIA" if total_val >= 10_000.0 else "BAIXA"
+                score = 70.0 if sev == "MEDIA" else 58.0
+                natureza_lbl = "pagamento sem elemento/histórico detalhado no portal"
+
+            elementos = sorted(
+                {
+                    str(ce.metadata.get("elemento") or "").strip()
+                    for ce, _, _ in suspicious
+                    if ce.metadata.get("elemento")
+                }
+            )
+            exemplos_desc = [
+                str(ce.metadata.get("objeto") or ce.metadata.get("historico") or "").strip()[:140]
+                for ce, _, _ in suspicious
+                if str(ce.metadata.get("objeto") or ce.metadata.get("historico") or "").strip()
+            ]
+            filtro_nota = ""
+            if filtered_counts:
+                n_desc = sum(filtered_counts.values())
+                filtro_nota = (
+                    f" ({n_desc} pagamento(s) regular(es) de diária/folha/reembolso "
+                    "descartado(s) automaticamente)."
+                )
+            detalhe_extra = ""
+            if elementos:
+                detalhe_extra += f" Elemento(s): {', '.join(elementos[:2])}."
+            if exemplos_desc:
+                detalhe_extra += f' Objeto/Histórico: "{exemplos_desc[0]}".'
+            elif cats & {"FORNECIMENTO_OU_SERVICO_COMERCIAL", "NAO_CLASSIFICADO_SEM_DESCRICAO"}:
+                detalhe_extra += (
+                    " Histórico não disponibilizado pelo portal; conferir se corresponde a "
+                    "prestação de serviço ou ressarcimento."
+                )
+
             alerts.append(
                 RiskAlert(
                     alert_id=make_stable_id("alerta", "CONFLITO_PF_SERVIDOR", pid, mun_id),
                     regra="CONFLITO_PF_SERVIDOR",
-                    severidade="ALTA",
-                    score=84.0,
+                    severidade=sev,
+                    score=score,
                     entidade_id=pid,
                     entidade_nome=p_nome,
-                    titulo=f"Servidor aparece como fornecedor/credor direto em {m_nome}",
+                    titulo=(
+                        f"Servidor aparece como fornecedor/contratado ({natureza_lbl}) em {m_nome}"
+                    ),
                     explicacao=(
-                        f"{p_nome} consta simultaneamente na folha de {m_nome} e como "
-                        f"credor/contratado direto ({len(c_edges)} registro(s), total "
-                        f"{_fmt_brl(total_val)}). Verificar se trata de diária/ressarcimento "
-                        "regular ou contratação direta."
+                        f"{p_nome} (cargo: {', '.join(cargos_raw[:2]) or 'não informado'}) consta "
+                        f"na folha de {m_nome} e figura em {len(suspicious)} registro(s) "
+                        f"classificado(s) como {natureza_lbl}, somando {_fmt_brl(total_val)}."
+                        f"{detalhe_extra}{filtro_nota}"
                     ),
                     evidencias=[
                         {
                             "tipo": "contratos_despesas",
+                            "classificacao": sorted(cats),
+                            "cargo_servidor": cargos_raw[:2],
+                            "elementos": elementos[:3],
+                            "objetos_historicos": exemplos_desc[:2],
+                            "quantidade_suspeita": len(suspicious),
+                            "descartados_regulares": dict(filtered_counts),
                             "valor_total": total_val,
-                            "url": c_edges[0].url_evidencia,
+                            "url": suspicious[0][0].url_evidencia,
                         }
                     ],
                 )

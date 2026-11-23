@@ -804,7 +804,11 @@ class GraphStore:
                     data_ref=data_ass or str(ct.get("ano") or ""),
                     fonte=str(ct.get("fonte") or "transparencia_municipios"),
                     url_evidencia=portal_url,
-                    metadata={"numero": numero, "objeto": objeto[:300]},
+                    metadata={
+                        "numero": numero,
+                        "objeto": objeto[:300],
+                        "situacao": str(ct.get("situacao", "")).strip(),
+                    },
                 )
             )
             edges_added += 1
@@ -822,6 +826,10 @@ class GraphStore:
             num_emp = str(desp.get("numero_empenho", "")).strip()
             data_d = str(desp.get("data", "")).strip()
             hist = str(desp.get("historico", "")).strip()
+            elemento = str(desp.get("elemento", "")).strip()
+            funcao = str(desp.get("funcao", "")).strip()
+            orgao = str(desp.get("orgao", "")).strip()
+            unidade = str(desp.get("unidade", "")).strip()
             target_id = self._upsert_supplier_node(forn, doc, uf)
             if not target_id:
                 continue
@@ -829,7 +837,7 @@ class GraphStore:
             self.upsert_edge(
                 GraphEdge(
                     edge_id=make_stable_id(
-                        "edge", mun_id, "PAGOU_DESPESA", target_id, num_emp, data_d
+                        "edge", mun_id, "PAGOU_DESPESA", target_id, num_emp, data_d, f"{valor:.2f}"
                     ),
                     src_id=mun_id,
                     dst_id=target_id,
@@ -838,7 +846,59 @@ class GraphStore:
                     data_ref=data_d or str(desp.get("ano") or ""),
                     fonte=str(desp.get("fonte") or "transparencia_municipios"),
                     url_evidencia=portal_url,
-                    metadata={"numero_empenho": num_emp, "historico": hist[:300]},
+                    metadata={
+                        "numero_empenho": num_emp,
+                        "historico": hist[:300],
+                        "elemento": elemento,
+                        "funcao": funcao,
+                        "orgao": orgao,
+                        "unidade": unidade,
+                    },
+                )
+            )
+            edges_added += 1
+
+        # 4. Diárias -> pessoa --[RECEBEU_DIARIA]--> municipio (triagem de falsos positivos)
+        for diar in rec.get("diarias") or []:
+            if not isinstance(diar, dict):
+                continue
+            benef = str(diar.get("beneficiario", "")).strip()
+            pid = make_pessoa_id(benef)
+            if not pid:
+                continue
+            valor = float(diar.get("valor") or 0.0)
+            data_d = str(diar.get("data") or diar.get("data_saida") or "").strip()
+            destino = str(diar.get("destino", "")).strip()
+            motivo = str(diar.get("motivo", "")).strip()
+            self.upsert_node(
+                GraphNode(
+                    node_id=pid,
+                    tipo="pessoa",
+                    chave_canonica=normalize_name(benef),
+                    nome=benef,
+                    uf=uf,
+                    codigo_ibge=ibge,
+                    metadata={"cargo": str(diar.get("cargo", "")).strip()},
+                )
+            )
+            nodes_added += 1
+            self.upsert_edge(
+                GraphEdge(
+                    edge_id=make_stable_id(
+                        "edge", pid, "RECEBEU_DIARIA", mun_id, data_d, destino, f"{valor:.2f}"
+                    ),
+                    src_id=pid,
+                    dst_id=mun_id,
+                    tipo_relacao="RECEBEU_DIARIA",
+                    valor=valor,
+                    data_ref=data_d,
+                    fonte=str(diar.get("fonte") or "transparencia_municipios"),
+                    url_evidencia=portal_url,
+                    metadata={
+                        "cargo": str(diar.get("cargo", "")).strip(),
+                        "destino": destino[:180],
+                        "motivo": motivo[:240],
+                    },
                 )
             )
             edges_added += 1

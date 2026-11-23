@@ -293,3 +293,244 @@ def test_same_cnpj_root_branches_do_not_trigger_shared_address() -> None:
 
         alerts = run_all_detectors(store, persist=False)
         assert not any(a.regra == "ENDERECO_COMPARTILHADO" for a in alerts)
+
+
+def test_conflito_pf_servidor_filters_diarias_folha_auxilios_estornos_and_html_mirrors() -> None:
+    """Diárias, folha, auxílios, indenizações, estornos e tabelas HTML espelhadas são filtrados."""
+    with GraphStore(":memory:") as store:
+        m1 = make_municipio_id("5211701")
+        store.upsert_node(
+            GraphNode(
+                node_id=m1,
+                tipo="municipio",
+                chave_canonica="5211701",
+                nome="Jandaia (GO)",
+                uf="GO",
+                codigo_ibge="5211701",
+            )
+        )
+
+        # 1) Servidor com diária (339014) + salário (319011) + auxílio-alimentação (339046)
+        #    + indenização trabalhista (319094) + restituição (339093) + contratação temp (319004)
+        #    + convênio saúde (339041) + estorno negativo (-142.0) -> TODOS falsos positivos
+        p_fp = make_pessoa_id("CARLOS ALBERTO SERVIDOR REGULAR")
+        store.upsert_node(
+            GraphNode(
+                node_id=p_fp,
+                tipo="pessoa",
+                chave_canonica="CARLOS ALBERTO SERVIDOR REGULAR",
+                nome="Carlos Alberto Servidor Regular",
+                uf="GO",
+            )
+        )
+        store.upsert_edge(
+            GraphEdge(
+                edge_id=make_stable_id("e", p_fp, "trab", m1),
+                src_id=p_fp,
+                dst_id=m1,
+                tipo_relacao="TRABALHA_EM",
+                valor=5000.0,
+                metadata={"cargo": "VEREADOR"},
+            )
+        )
+        fp_cases = [
+            (600.0, "339014 - DIARIAS CIVIL", "CONCESSAO DE DIARIA PARA VIAGEM A GOIANIA"),
+            (5064.45, "319011 - VENCIMENTOS E VANTAGENS FIXAS", "SUBSIDIO SALARIAL MENSAL"),
+            (600.0, "339046 - AUXILIO-ALIMENTACAO", "AUXILIO ALIMENTACAO COMPETENCIA 11/2024"),
+            (711.92, "319094 - INDENIZACOES TRABALHISTAS", "ACERTO DE VERBAS SALARIAIS"),
+            (100.0, "33909303000 - OUTRAS INDENIZACOES E RESTITUICOES", ""),
+            (864.95, "31900499000 - OUTRAS CONTRATACOES POR TEMPO DETERMINADO", ""),
+            (2000.0, "339034 - OUTRAS DESPESAS DE PESSOAL - TERCEIRIZACAO", "AGENTE ENDEMIAS"),
+            (230.25, "339041 - CONTRIBUICOES", "PAGAMENTO DE CONVENIO IPASGO 50%"),
+            (-142.0, "33903999000 - OUTROS SERVICOS DE TERCEIROS - PJ", ""),
+            (0.0, "", ""),
+        ]
+        for idx, (val, elem, hist) in enumerate(fp_cases):
+            store.upsert_edge(
+                GraphEdge(
+                    edge_id=make_stable_id("e", m1, "dp_fp", p_fp, str(idx)),
+                    src_id=m1,
+                    dst_id=p_fp,
+                    tipo_relacao="PAGOU_DESPESA",
+                    valor=val,
+                    metadata={"elemento": elem, "historico": hist},
+                )
+            )
+
+        # 2) Servidor com tabela HTML espelhada (sem elemento/histórico, funcao == cargo)
+        p_html = make_pessoa_id("MARIA HTML ESPELHO")
+        store.upsert_node(
+            GraphNode(
+                node_id=p_html,
+                tipo="pessoa",
+                chave_canonica="MARIA HTML ESPELHO",
+                nome="Maria HTML Espelho",
+                uf="BA",
+            )
+        )
+        store.upsert_edge(
+            GraphEdge(
+                edge_id=make_stable_id("e", p_html, "trab", m1),
+                src_id=p_html,
+                dst_id=m1,
+                tipo_relacao="TRABALHA_EM",
+                metadata={"cargo": "ENFERMEIRO CONTRATADO"},
+            )
+        )
+        store.upsert_edge(
+            GraphEdge(
+                edge_id=make_stable_id("e", m1, "dp_html", p_html),
+                src_id=m1,
+                dst_id=p_html,
+                tipo_relacao="PAGOU_DESPESA",
+                valor=1500.0,
+                metadata={"funcao": "ENFERMEIRO CONTRATADO"},
+            )
+        )
+
+        # 3) Servidor com despesa sem descrição mas presente em RECEBEU_DIARIA
+        p_diar = make_pessoa_id("JOSE DIARIA CRUZADA")
+        store.upsert_node(
+            GraphNode(
+                node_id=p_diar,
+                tipo="pessoa",
+                chave_canonica="JOSE DIARIA CRUZADA",
+                nome="José Diária Cruzada",
+                uf="GO",
+            )
+        )
+        store.upsert_edge(
+            GraphEdge(
+                edge_id=make_stable_id("e", p_diar, "trab", m1),
+                src_id=p_diar,
+                dst_id=m1,
+                tipo_relacao="TRABALHA_EM",
+                metadata={"cargo": "MOTORISTA"},
+            )
+        )
+        store.upsert_edge(
+            GraphEdge(
+                edge_id=make_stable_id("e", p_diar, "diar", m1),
+                src_id=p_diar,
+                dst_id=m1,
+                tipo_relacao="RECEBEU_DIARIA",
+                valor=300.0,
+            )
+        )
+        store.upsert_edge(
+            GraphEdge(
+                edge_id=make_stable_id("e", m1, "dp_diar", p_diar),
+                src_id=m1,
+                dst_id=p_diar,
+                tipo_relacao="PAGOU_DESPESA",
+                valor=300.0,
+            )
+        )
+
+        alerts = run_all_detectors(store, persist=False)
+        pf_alerts = [a for a in alerts if a.regra == "CONFLITO_PF_SERVIDOR"]
+        assert pf_alerts == []
+
+
+def test_conflito_pf_servidor_keeps_commercial_contracts_and_excludes_diaria() -> None:
+    """Contratos comerciais (ex: locação de imóvel) e serviços PF mantêm alerta com valor limpo."""
+    with GraphStore(":memory:") as store:
+        m1 = make_municipio_id("5222302")
+        store.upsert_node(
+            GraphNode(
+                node_id=m1,
+                tipo="municipio",
+                chave_canonica="5222302",
+                nome="Vila Propício (GO)",
+                uf="GO",
+                codigo_ibge="5222302",
+            )
+        )
+
+        # Caso A: Servidor com locação de imóvel + uma diária (diária deve ser excluída da soma)
+        p_loc = make_pessoa_id("ABIGAIL LOCADORA SERVIDORA")
+        store.upsert_node(
+            GraphNode(
+                node_id=p_loc,
+                tipo="pessoa",
+                chave_canonica="ABIGAIL LOCADORA SERVIDORA",
+                nome="Abigail Locadora Servidora",
+                uf="GO",
+            )
+        )
+        store.upsert_edge(
+            GraphEdge(
+                edge_id=make_stable_id("e", p_loc, "trab", m1),
+                src_id=p_loc,
+                dst_id=m1,
+                tipo_relacao="TRABALHA_EM",
+                metadata={"cargo": "ASSESSOR EXECUTIVO"},
+            )
+        )
+        store.upsert_edge(
+            GraphEdge(
+                edge_id=make_stable_id("e", m1, "ct_loc", p_loc),
+                src_id=m1,
+                dst_id=p_loc,
+                tipo_relacao="CONTRATOU",
+                valor=4500.0,
+                metadata={"numero": "442", "objeto": "LOCAÇÃO DE IMÓVEL URBANO PARA ESCOLA"},
+            )
+        )
+        store.upsert_edge(
+            GraphEdge(
+                edge_id=make_stable_id("e", m1, "dp_diaria", p_loc),
+                src_id=m1,
+                dst_id=p_loc,
+                tipo_relacao="PAGOU_DESPESA",
+                valor=650.0,
+                metadata={"elemento": "339014 - DIARIAS CIVIL", "historico": "DIARIA VIAGEM"},
+            )
+        )
+
+        # Caso B: Servidor com pagamento 339036 (Serviços PF) sem histórico -> severidade MEDIA
+        p_pf = make_pessoa_id("VERA SERVICO PF")
+        store.upsert_node(
+            GraphNode(
+                node_id=p_pf,
+                tipo="pessoa",
+                chave_canonica="VERA SERVICO PF",
+                nome="Vera Serviço PF",
+                uf="MG",
+            )
+        )
+        store.upsert_edge(
+            GraphEdge(
+                edge_id=make_stable_id("e", p_pf, "trab", m1),
+                src_id=p_pf,
+                dst_id=m1,
+                tipo_relacao="TRABALHA_EM",
+                metadata={"cargo": "SERVENTE ESCOLAR"},
+            )
+        )
+        store.upsert_edge(
+            GraphEdge(
+                edge_id=make_stable_id("e", m1, "dp_36", p_pf),
+                src_id=m1,
+                dst_id=p_pf,
+                tipo_relacao="PAGOU_DESPESA",
+                valor=700.0,
+                metadata={"elemento": "33903699000 - Outros Servicos de Pessoa Fisica"},
+            )
+        )
+
+        alerts = run_all_detectors(store, persist=False)
+        pf_by_ent = {a.entidade_id: a for a in alerts if a.regra == "CONFLITO_PF_SERVIDOR"}
+        assert set(pf_by_ent.keys()) == {p_loc, p_pf}
+
+        a_loc = pf_by_ent[p_loc]
+        assert a_loc.severidade == "ALTA"
+        assert a_loc.evidencias[0]["valor_total"] == 4500.0
+        assert a_loc.evidencias[0]["descartados_regulares"] == {"DIARIA_PASSAGEM": 1}
+        assert "LOCAÇÃO DE IMÓVEL" in a_loc.explicacao
+
+        a_pf = pf_by_ent[p_pf]
+        assert a_pf.severidade == "MEDIA"
+        assert a_pf.evidencias[0]["valor_total"] == 700.0
+        assert "33903699000" in a_pf.explicacao
+

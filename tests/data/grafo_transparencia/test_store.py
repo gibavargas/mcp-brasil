@@ -212,3 +212,47 @@ def test_import_harvest_ndjson(tmp_path: Path) -> None:
         p = store.get_node(make_pessoa_id("JOAO CARLOS ZAMBONI"))
         assert p is not None
         assert p.metadata["cpf_parcial"] == "***.456.789-**"
+
+
+def test_ingest_harvest_preserves_despesa_metadata_and_diarias() -> None:
+    record = {
+        "codigo_ibge": "5211701",
+        "nome": "Jandaia",
+        "uf": "GO",
+        "portal_url": "https://jandaia.megasofttransparencia.com.br/",
+        "despesas": [
+            {
+                "numero_empenho": "101",
+                "data": "2024-12-10",
+                "fornecedor": "ADILSON TAVARES OLIVEIRA",
+                "elemento": "339014 - DIARIAS CIVIL",
+                "funcao": "1 - Legislativa",
+                "orgao": "Câmara Municipal",
+                "historico": "CONCESSAO DE DIARIA A GOIANIA",
+                "valor_pago": 600.0,
+            }
+        ],
+        "diarias": [
+            {
+                "beneficiario": "ADILSON TAVARES OLIVEIRA",
+                "cargo": "VEREADOR",
+                "destino": "GOIANIA-GO",
+                "motivo": "Reunião institucional",
+                "data": "2024-12-10",
+                "valor": 600.0,
+            }
+        ],
+    }
+    with GraphStore(":memory:") as store:
+        store.ingest_harvest_record(record)
+        dp_edges = store.get_all_edges("PAGOU_DESPESA")
+        assert len(dp_edges) == 1
+        assert dp_edges[0].metadata["elemento"] == "339014 - DIARIAS CIVIL"
+        assert dp_edges[0].metadata["funcao"] == "1 - Legislativa"
+        assert "DIARIA" in dp_edges[0].metadata["historico"]
+
+        diar_edges = store.get_all_edges("RECEBEU_DIARIA")
+        assert len(diar_edges) == 1
+        assert diar_edges[0].valor == 600.0
+        assert diar_edges[0].metadata["destino"] == "GOIANIA-GO"
+
