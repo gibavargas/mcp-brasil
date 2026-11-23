@@ -69,7 +69,7 @@ async def fetch_cnpj_qsa(
         if isinstance(cached, dict):
             return cached
     try:
-        url = BRASILAPI_CNPJ_URL.format(cnpj=norm)
+        url = f"{BRASILAPI_CNPJ_URL.rstrip('/')}/{norm}"
         raw = await http_get(url)
         if isinstance(raw, dict):
             store.set_cache(cache_key, "brasilapi", raw, DEFAULT_CACHE_TTL_SECONDS)
