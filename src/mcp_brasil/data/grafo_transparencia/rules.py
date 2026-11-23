@@ -848,6 +848,25 @@ def detect_vinculos_intermunicipais(
         if e.tipo_relacao == "TRABALHA_EM" and e.src_id.startswith("pessoa:"):
             person_muns[e.src_id][e.dst_id].append(e)
 
+    # Detecta pares espelhados (mesma portal_url ou >=10 sobreposições idênticas a >120 km)
+    pair_overlaps: dict[tuple[str, str], int] = defaultdict(int)
+    for m_map in person_muns.values():
+        if len(m_map) < 2:
+            continue
+        m_list = sorted(m_map.keys())
+        for i in range(len(m_list)):
+            for j in range(i + 1, len(m_list)):
+                pair_overlaps[(m_list[i], m_list[j])] += 1
+
+    def _is_mirrored_pair(mid_a: str, mid_b: str, dist_km: float) -> bool:
+        pair = (mid_a, mid_b) if mid_a < mid_b else (mid_b, mid_a)
+        na, nb = nodes.get(mid_a), nodes.get(mid_b)
+        ua = str((na.metadata if na else {}).get("portal_url") or "").strip().lower().rstrip("/")
+        ub = str((nb.metadata if nb else {}).get("portal_url") or "").strip().lower().rstrip("/")
+        if ua and ub and ua == ub:
+            return True
+        return dist_km > 120.0 and pair_overlaps.get(pair, 0) >= 10
+
     for pid, m_map in person_muns.items():
         if len(m_map) < 2:
             continue
@@ -860,6 +879,7 @@ def detect_vinculos_intermunicipais(
         best_score = 0.0
         max_dist = 0.0
         best_reasons: list[str] = []
+        valid_mun_ids: set[str] = set()
 
         for i in range(len(mun_ids)):
             for j in range(i + 1, len(mun_ids)):
@@ -867,6 +887,10 @@ def detect_vinculos_intermunicipais(
                 m2 = nodes.get(mun_ids[j])
                 e1 = m_map[mun_ids[i]][0]
                 e2 = m_map[mun_ids[j]][0]
+                u1 = (e1.url_evidencia or "").strip().lower().rstrip("/")
+                u2 = (e2.url_evidencia or "").strip().lower().rstrip("/")
+                if u1 and u2 and u1 == u2:
+                    continue
                 dist = 0.0
                 if m1 and m2:
                     dist = haversine_km(
@@ -875,6 +899,10 @@ def detect_vinculos_intermunicipais(
                         float(m2.metadata.get("latitude") or 0.0),
                         float(m2.metadata.get("longitude") or 0.0),
                     )
+                if _is_mirrored_pair(mun_ids[i], mun_ids[j], dist):
+                    continue
+                valid_mun_ids.add(mun_ids[i])
+                valid_mun_ids.add(mun_ids[j])
                 sc, reasons = compute_person_match_score(
                     nome=p_nome,
                     cpf_a=str(e1.metadata.get("cpf_parcial", "")),
@@ -890,26 +918,28 @@ def detect_vinculos_intermunicipais(
                     best_reasons = reasons
                 max_dist = max(max_dist, dist)
 
-        if best_score < MIN_PERSON_MATCH_SCORE:
+        if len(valid_mun_ids) < 2 or best_score < MIN_PERSON_MATCH_SCORE:
             continue
 
-        total_sal = sum(max((x.valor for x in es), default=0.0) for es in m_map.values())
-        mun_labels = [nodes[mid].nome if mid in nodes else mid for mid in mun_ids]
+        valid_sorted = sorted(valid_mun_ids)
+        total_sal = sum(max((x.valor for x in m_map[mid]), default=0.0) for mid in valid_sorted)
+        mun_labels = [nodes[mid].nome if mid in nodes else mid for mid in valid_sorted]
         sev: SeverityLevel = (
             "ALTA"
-            if (len(mun_ids) >= 3 or max_dist >= LONG_DISTANCE_PAYROLL_KM) and best_score >= 75.0
+            if (len(valid_sorted) >= 3 or max_dist >= LONG_DISTANCE_PAYROLL_KM)
+            and best_score >= 75.0
             else "MEDIA"
         )
 
         alerts.append(
             RiskAlert(
-                alert_id=make_stable_id("alerta", "VINCULO_INTERMUNICIPAL", pid, *mun_ids),
+                alert_id=make_stable_id("alerta", "VINCULO_INTERMUNICIPAL", pid, *valid_sorted),
                 regra="VINCULO_INTERMUNICIPAL",
                 severidade=sev,
                 score=best_score,
                 entidade_id=pid,
                 entidade_nome=p_nome,
-                titulo=f"Indício de vínculo em {len(mun_ids)} órgãos/municípios: {p_nome}",
+                titulo=f"Indício de vínculo em {len(valid_sorted)} órgãos/municípios: {p_nome}",
                 explicacao=(
                     f"{p_nome} aparece em folhas distintas ({', '.join(mun_labels[:5])}), "
                     f"soma estimada de remunerações: {_fmt_brl(total_sal)}"
@@ -924,7 +954,7 @@ def detect_vinculos_intermunicipais(
                         "cpf_parcial": m_map[mid][0].metadata.get("cpf_parcial", ""),
                         "url": m_map[mid][0].url_evidencia,
                     }
-                    for mid in mun_ids
+                    for mid in valid_sorted
                 ],
             )
         )
